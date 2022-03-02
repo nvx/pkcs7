@@ -2,10 +2,10 @@ package pkcs7
 
 import (
 	"bytes"
+	"encoding/asn1"
 	"errors"
+	"sort"
 )
-
-var encodeIndent = 0
 
 type asn1Object interface {
 	EncodeTo(writer *bytes.Buffer) error
@@ -16,26 +16,110 @@ type asn1Structured struct {
 	content  []asn1Object
 }
 
+func concatStringTypes(tagType byte, content []asn1Object) ([]byte, error) {
+	out := new(bytes.Buffer)
+
+	for _, c := range content {
+		var str []byte
+		switch c := c.(type) {
+		case asn1Primitive:
+			if len(c.tagBytes) != 1 || c.tagBytes[0] != tagType {
+				return nil, errors.New("ber2der: mixed string types in constructed string")
+			}
+			str = c.content
+		case asn1Structured:
+			if len(c.tagBytes) != 1 || c.tagBytes[0]&^0x20 != tagType {
+				return nil, errors.New("ber2der: mixed string types in constructed string")
+			}
+			var err error
+			str, err = concatStringTypes(tagType, c.content)
+			if err != nil {
+				return nil, err
+			}
+		default:
+			return nil, errors.New("ber2der: got unknown object type")
+		}
+
+		_, err := out.Write(str)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return out.Bytes(), nil
+}
+
 func (s asn1Structured) EncodeTo(out *bytes.Buffer) error {
-	//fmt.Printf("%s--> tag: % X\n", strings.Repeat("| ", encodeIndent), s.tagBytes)
-	encodeIndent++
+	var needSort bool
+	if len(s.tagBytes) == 1 {
+		tag := s.tagBytes[0] &^ 0x20 // Clear structured bit
+		switch tag {
+		case asn1.TagSet:
+			// DER requires SETs to be sorted by Tag
+			needSort = true
+		case asn1.TagBitString, asn1.TagOctetString, asn1.TagUTF8String, asn1.TagNumericString, asn1.TagPrintableString,
+			asn1.TagT61String, asn1.TagIA5String, asn1.TagUTCTime, asn1.TagGeneralizedTime, asn1.TagGeneralString, asn1.TagBMPString:
+			// DER requires strings to be encoded as primitive types
+			content, err := concatStringTypes(tag, s.content)
+			if err != nil {
+				return err
+			}
+			prim := asn1Primitive{
+				tagBytes: []byte{tag},
+				content:  content,
+			}
+			return prim.EncodeTo(out)
+		}
+	}
+
 	inner := new(bytes.Buffer)
+	var sortBuf [][]byte
+
 	for _, obj := range s.content {
 		err := obj.EncodeTo(inner)
 		if err != nil {
 			return err
 		}
+
+		if needSort {
+			sortBuf = append(sortBuf, inner.Bytes())
+			inner = new(bytes.Buffer) // fresh buffer for next time
+		}
 	}
-	encodeIndent--
-	out.Write(s.tagBytes)
-	encodeLength(out, inner.Len())
-	out.Write(inner.Bytes())
+
+	if needSort {
+		sort.Slice(sortBuf, func(i, j int) bool {
+			return bytes.Compare(sortBuf[i], sortBuf[j]) == -1
+		})
+
+		for _, buf := range sortBuf {
+			_, err := inner.Write(buf)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	_, err := out.Write(s.tagBytes)
+	if err != nil {
+		return err
+	}
+
+	err = encodeLength(out, inner.Len())
+	if err != nil {
+		return err
+	}
+
+	_, err = out.Write(inner.Bytes())
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
 type asn1Primitive struct {
 	tagBytes []byte
-	length   int
 	content  []byte
 }
 
@@ -44,12 +128,16 @@ func (p asn1Primitive) EncodeTo(out *bytes.Buffer) error {
 	if err != nil {
 		return err
 	}
-	if err = encodeLength(out, p.length); err != nil {
+
+	err = encodeLength(out, len(p.content))
+	if err != nil {
 		return err
 	}
-	//fmt.Printf("%s--> tag: % X length: %d\n", strings.Repeat("| ", encodeIndent), p.tagBytes, p.length)
-	//fmt.Printf("%s--> content length: %d\n", strings.Repeat("| ", encodeIndent), len(p.content))
-	out.Write(p.content)
+
+	_, err = out.Write(p.content)
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -65,7 +153,11 @@ func ber2der(ber []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	obj.EncodeTo(out)
+
+	err = obj.EncodeTo(out)
+	if err != nil {
+		return nil, err
+	}
 
 	// if offset < len(ber) {
 	//	return nil, fmt.Errorf("ber2der: Content longer than expected. Got %d, expected %d", offset, len(ber))
@@ -143,21 +235,18 @@ func readObject(ber []byte, offset int) (asn1Object, int, error) {
 	if offset >= berLen {
 		return nil, 0, errors.New("ber2der: cannot move offset forward, end of ber data reached")
 	}
-	tag := b & 0x1F // last 5 bits
+	tag := int(b & 0x1F) // last 5 bits
 	if tag == 0x1F {
 		tag = 0
-		for ber[offset] >= 0x80 {
-			tag = tag*128 + ber[offset] - 0x80
+		for {
+			tag = tag*0x80 + int(ber[offset]&0x7F)
 			offset++
 			if offset > berLen {
 				return nil, 0, errors.New("ber2der: cannot move offset forward, end of ber data reached")
 			}
-		}
-		// jvehent 20170227: this doesn't appear to be used anywhere...
-		//tag = tag*128 + ber[offset] - 0x80
-		offset++
-		if offset > berLen {
-			return nil, 0, errors.New("ber2der: cannot move offset forward, end of ber data reached")
+			if ber[offset-1]&0x80 != 0x80 {
+				break
+			}
 		}
 	}
 	tagEnd := offset
@@ -188,7 +277,7 @@ func readObject(ber []byte, offset int) (asn1Object, int, error) {
 			return nil, 0, errors.New("ber2der: BER tag length has leading zero")
 		}
 		debugprint("--> (compute length) indicator byte: %x\n", l)
-		debugprint("--> (compute length) length bytes: % X\n", ber[offset:offset+numberOfBytes])
+		debugprint("--> (compute length) length bytes: %X\n", ber[offset:offset+numberOfBytes])
 		for i := 0; i < numberOfBytes; i++ {
 			length = length*256 + (int)(ber[offset])
 			offset++
@@ -211,7 +300,8 @@ func readObject(ber []byte, offset int) (asn1Object, int, error) {
 	}
 	debugprint("--> content start : %d\n", offset)
 	debugprint("--> content end   : %d\n", contentEnd)
-	debugprint("--> content       : % X\n", ber[offset:contentEnd])
+	debugprint("--> content len   : %d\n", length)
+	debugprint("--> content       : %X\n", ber[offset:contentEnd])
 	var obj asn1Object
 	if indefinite && kind == 0 {
 		return nil, 0, errors.New("ber2der: Indefinite form tag must have constructed encoding")
@@ -219,20 +309,11 @@ func readObject(ber []byte, offset int) (asn1Object, int, error) {
 	if kind == 0 {
 		obj = asn1Primitive{
 			tagBytes: ber[tagStart:tagEnd],
-			length:   length,
 			content:  ber[offset:contentEnd],
 		}
 	} else {
 		var subObjects []asn1Object
 		for (offset < contentEnd) || indefinite {
-			var subObj asn1Object
-			var err error
-			subObj, offset, err = readObject(ber, offset)
-			if err != nil {
-				return nil, 0, err
-			}
-			subObjects = append(subObjects, subObj)
-
 			if indefinite {
 				terminated, err := isIndefiniteTermination(ber, offset)
 				if err != nil {
@@ -243,6 +324,14 @@ func readObject(ber []byte, offset int) (asn1Object, int, error) {
 					break
 				}
 			}
+
+			var subObj asn1Object
+			var err error
+			subObj, offset, err = readObject(ber, offset)
+			if err != nil {
+				return nil, 0, err
+			}
+			subObjects = append(subObjects, subObj)
 		}
 		obj = asn1Structured{
 			tagBytes: ber[tagStart:tagEnd],
@@ -259,7 +348,7 @@ func readObject(ber []byte, offset int) (asn1Object, int, error) {
 }
 
 func isIndefiniteTermination(ber []byte, offset int) (bool, error) {
-	if len(ber) - offset < 2 {
+	if len(ber)-offset < 2 {
 		return false, errors.New("ber2der: Invalid BER format")
 	}
 
@@ -267,5 +356,5 @@ func isIndefiniteTermination(ber []byte, offset int) (bool, error) {
 }
 
 func debugprint(format string, a ...interface{}) {
-	//fmt.Printf(format, a)
+	//fmt.Printf(format, a...)
 }
